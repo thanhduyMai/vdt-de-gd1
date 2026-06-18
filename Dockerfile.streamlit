@@ -1,0 +1,12 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Cài đặt đúng 4 thư viện cần thiết
+RUN pip install streamlit pandas keplergl trino
+
+# Mở cổng mặc định của Streamlit
+EXPOSE 8501
+
+# Lệnh tự động chạy app khi container bật lên
+CMD ["streamlit", "run", "/opt/spark_scripts/7_app_streamlit.py", "--server.port=8501", "--server.address=0.0.0.0"]

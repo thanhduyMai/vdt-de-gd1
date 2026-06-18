@@ -1,0 +1,185 @@
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - SPARK_SQL_EXTENSIONS=io.delta.sql.DeltaSparkSessionExtension
+    - SPARK_SQL_CATALOG_SPARK_CATALOG=org.apache.spark.sql.delta.catalog.DeltaCatalog
+    - PYSPARK_PYTHON=/usr/local/bin/python
+    - PYSPARK_DRIVER_PYTHON=/usr/local/bin/python
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./spark_scripts:/opt/spark_scripts
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # 1. DATABASE CHO AIRFLOW (Chỉ dùng riêng cho backend của Airflow)
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  # 2. KHỞI TẠO AIRFLOW
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+      airflow db migrate &&
+      (airflow users create --username admin --firstname Mai --lastname Duy --role Admin --email maithanhduy1705@gmail.com --password admin || true)
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # 3. AIRFLOW WEBSERVER
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # 4. AIRFLOW SCHEDULER
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # 5. SPARK MASTER
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    environment:
+      - SPARK_SQL_EXTENSIONS=io.delta.sql.DeltaSparkSessionExtension
+      - SPARK_SQL_CATALOG_SPARK_CATALOG=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      - PYSPARK_PYTHON=/usr/local/bin/python
+      - PYSPARK_DRIVER_PYTHON=/usr/local/bin/python
+    command: spark-class org.apache.spark.deploy.master.Master -h 0.0.0.0
+    ports:
+      - "8081:8080" # Web UI của Master
+      - "7077:7077"
+    volumes:
+      - ./spark_scripts:/opt/spark_scripts
+
+  # 6. SPARK WORKER SỐ 1
+  spark-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: mdt_spark_worker_1
+    environment:
+      - SPARK_SQL_EXTENSIONS=io.delta.sql.DeltaSparkSessionExtension
+      - SPARK_SQL_CATALOG_SPARK_CATALOG=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      - PYSPARK_PYTHON=/usr/local/bin/python
+      - PYSPARK_DRIVER_PYTHON=/usr/local/bin/python
+    command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 -c 2 -m 2G
+    ports:
+      - "8082:8081" # Web UI của Worker 1
+    volumes:
+      - ./spark_scripts:/opt/spark_scripts
+    depends_on:
+      - spark-master
+
+  # 7. SPARK WORKER SỐ 2
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: mdt_spark_worker_2
+    environment:
+      - SPARK_SQL_EXTENSIONS=io.delta.sql.DeltaSparkSessionExtension
+      - SPARK_SQL_CATALOG_SPARK_CATALOG=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      - PYSPARK_PYTHON=/usr/local/bin/python
+      - PYSPARK_DRIVER_PYTHON=/usr/local/bin/python
+    command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 -c 2 -m 2G
+    ports:
+      - "8083:8081" # Web UI của Worker 2
+    volumes:
+      - ./spark_scripts:/opt/spark_scripts
+    depends_on:
+      - spark-master
+
+  # 8. MINIO (Lakehouse Storage)
+  minio:
+    image: minio/minio:latest
+    container_name: mdt_minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password123
+    ports:
+      - "9000:9000" # Port API
+      - "9001:9001" # Port Web UI
+    command: server /data1 /data2 /data3 /data4 --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio_data1:/data1
+      - minio_data2:/data2
+      - minio_data3:/data3
+      - minio_data4:/data4
+
+  # 9. TRINO (The SQL Query Engine)
+  trino:
+    image: trinodb/trino:latest
+    container_name: mdt_trino
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./trino_etc/catalog:/etc/trino/catalog
+    depends_on:
+      - minio
+  # ---------------------------------------------------
+  # HIVE METASTORE (Dùng chung DB với Airflow để tiết kiệm RAM)
+  # ---------------------------------------------------
+  hive-metastore:
+    build:
+      context: .
+      dockerfile: Dockerfile.metastore
+    container_name: mdt_hive_metastore
+    ports:
+      - "9083:9083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+  
+  mdt-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: mdt_dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount chung thư mục spark_scripts để nó đọc được file 7_app_streamlit.py
+      - ./spark_scripts:/opt/spark_scripts
+    depends_on:
+      - trino
+volumes:
+  minio_data1:
+  minio_data2:
+  minio_data3:
+  minio_data4:
