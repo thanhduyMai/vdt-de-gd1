@@ -1,11 +1,11 @@
 import argparse
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
+from delta.tables import DeltaTable  # Import thêm thư viện DeltaTable để làm MERGE
 
 def main():
-    # 1. Khởi tạo Spark Session
     spark = SparkSession.builder \
-        .appName("Init_Dim_Cell_From_LandingZone") \
+        .appName("Update_Dim_Cell_SCD1") \
         .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
         .config("spark.hadoop.fs.s3a.access.key", "admin") \
         .config("spark.hadoop.fs.s3a.secret.key", "password123") \
@@ -17,37 +17,48 @@ def main():
 
     print("🚀 Đang kéo file cấu hình trạm từ MinIO Landing Zone...")
 
-    # 2. Định nghĩa đường dẫn
     input_csv = "s3a://landingzone/cell_info.csv" 
     output_delta = "s3a://gold/dim_cell/"
 
     try:
-        # 3. Đọc CSV với header
+        # 1. Đọc và chuẩn hóa dữ liệu MỚI từ CSV
         df_cell = spark.read.csv(input_csv, header=True, inferSchema=True)
 
-        # 4. CHUẨN HÓA CẤU TRÚC MỚI
         df_clean = df_cell.select(
             F.col("cell_code").cast("string"),
-            F.col("x").cast("double").alias("station_lat"), # Đổi x thành lat
-            F.col("y").cast("double").alias("station_lng"), # Đổi y thành lng
-            F.lit(20.0).cast("double").alias("bandwidth"),  # Tự động điền 20MHz vì file thiếu
+            F.col("x").cast("double").alias("station_lat"), 
+            F.col("y").cast("double").alias("station_lng"),  
             F.col("station_code").cast("string").alias("sector_code"),
             F.col("azimuth").cast("double"),
             F.col("province_name").cast("string"),
             F.col("district_name").cast("string")
         )
         
-        # 5. Khử trùng lặp (Dedup) theo cell_code để đảm bảo tính duy nhất
-        df_final = df_clean.dropDuplicates(["cell_code"])
+        # Khử trùng lặp file nguồn để tránh lỗi Merge
+        df_new = df_clean.dropDuplicates(["cell_code"])
 
-        # 6. Ghi đè xuống Delta Lake tầng Gold
-        print(" Đang ghi đè dữ liệu Trạm (dim_cell) xuống Delta Lake (Gold)...")
-        df_final.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(output_delta)
-        
-        print(f" Đã nạp thành công {df_final.count()} trạm vào Lakehouse tại s3a://gold/dim_cell/")
-        
+        # ====================================================================
+        # 2. THỰC HIỆN SCD TYPE 1 (UPSERT) BẰNG DELTA LAKE MERGE
+        # ====================================================================
+        if DeltaTable.isDeltaTable(spark, output_delta):
+            print(" Đã tìm thấy bảng dim_cell cũ. Tiến hành MERGE (Upsert) SCD Type 1...")
+            deltaTable = DeltaTable.forPath(spark, output_delta)
+            
+            deltaTable.alias("old").merge(
+                df_new.alias("new"),
+                "old.cell_code = new.cell_code" # Điều kiện khớp Khóa (Key)
+            ).whenMatchedUpdateAll( # Nếu Khóa đã tồn tại -> Cập nhật toàn bộ các cột khác
+            ).whenNotMatchedInsertAll( # Nếu Khóa chưa từng có -> Thêm dòng mới
+            ).execute()
+            
+            print(" Cập nhật SCD Type 1 hoàn tất!")
+        else:
+            # Nếu chạy lần đầu tiên, chưa có bảng
+            print(" Chưa có bảng dim_cell. Tiến hành tạo mới (Initial Load)...")
+            df_new.write.format("delta").mode("overwrite").save(output_delta)
+
     except Exception as e:
-        print(f" Lỗi nạp dim_cell: {e}")
+        print(f" Lỗi nạp/cập nhật dim_cell: {e}")
 
     spark.stop()
 
