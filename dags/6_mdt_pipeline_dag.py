@@ -168,6 +168,7 @@ with DAG(
         application='/opt/spark_scripts/6_forecast.py',
         conn_id='spark_default',
         execution_timeout=timedelta(minutes=30), 
+        application_args=common_args
     )
 
     task_publish_trino = BashOperator(

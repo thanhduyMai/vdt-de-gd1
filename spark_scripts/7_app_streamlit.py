@@ -13,19 +13,11 @@ warnings.filterwarnings('ignore', message='.*SQLAlchemy connectable.*')
 
 st.set_page_config(page_title="MDT Coverage Live", layout="wide", page_icon="📡")
 
-# =========================================================================
-# KẾT NỐI TRINO DÙNG CHUNG
-# =========================================================================
 def get_trino_connection():
-    # Nhớ đổi thành "localhost" nếu chạy Streamlit từ ngoài máy tính/Docker
     return trino.dbapi.connect(
         host="mdt_trino", port=8080, user="admin", catalog="lakehouse", schema="default"
     )
 
-# =========================================================================
-# TỐI ƯU 1: LẤY DANH SÁCH BỘ LỌC ĐỘC LẬP (Cực nhẹ)
-# =========================================================================
-#@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_filter_options(date_str):
     conn = None
     try:
@@ -39,23 +31,17 @@ def fetch_filter_options(date_str):
         if conn:
             conn.close()
 
-# =========================================================================
-# TỐI ƯU 2: ĐẨY 100% LOGIC AGGREGATION & TOÁN HỌC XUỐNG TRINO
-# =========================================================================
-#@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_dashboard_data(date_str, selected_h3, selected_cell):
     conn = None
     try:
         conn = get_trino_connection()
         
-        # Chèn điều kiện lọc động thẳng vào SQL (Pushdown Filter)
         h3_cond = f"AND f.h3_index = '{selected_h3}'" if selected_h3 != "Toàn mạng lưới" else ""
         cell_cond = f"AND f.cell_id = '{selected_cell}'" if selected_cell != "Toàn mạng lưới" else ""
 
-        # 1. SQL Kéo dữ liệu không gian cho Bản đồ
         query_spatial = f"""
         WITH BaseData AS ( 
-            SELECT f.h3_index, f.cell_id, c.station_lat AS cell_lat, c.station_lng AS cell_lon, c.bandwidth, h.h3_center_lat, h.h3_center_lon, f.user_density_count AS user_density, f.avg_rsrp, f.avg_distance_km, f.p10_rsrp, CAST(f.hour AS INTEGER) AS hour_num, 
+            SELECT f.h3_index, f.cell_id, c.station_lat AS cell_lat, c.station_lng AS cell_lon, h.h3_center_lat, h.h3_center_lon, f.user_density_count AS user_density, f.avg_rsrp, f.avg_distance_km, f.p10_rsrp, CAST(f.hour AS INTEGER) AS hour_num, 
             date_parse(f.date || ' ' || LPAD(CAST(f.hour AS VARCHAR), 2, '0') || ':00:00', '%Y-%m-%d %H:%i:%s') AS record_time 
             FROM lakehouse.default.fact_mdt_hourly f 
             LEFT JOIN lakehouse.default.dim_cell c ON f.cell_id = UPPER(TRIM(c.cell_code)) 
@@ -65,7 +51,7 @@ def fetch_dashboard_data(date_str, selected_h3, selected_cell):
             SELECT *, user_density - LAG(user_density, 1, 0) OVER (PARTITION BY cell_id, h3_index ORDER BY hour_num ASC) AS density_diff 
             FROM BaseData 
         ) 
-        SELECT h3_index, cell_id, cell_lat, cell_lon, bandwidth, h3_center_lat, h3_center_lon, user_density, avg_rsrp, avg_distance_km, p10_rsrp, record_time, 
+        SELECT h3_index, cell_id, cell_lat, cell_lon, h3_center_lat, h3_center_lon, user_density, avg_rsrp, avg_distance_km, p10_rsrp, record_time, 
         CASE 
             WHEN avg_rsrp < -100 AND user_density >= 50 THEN ' Cần tối ưu' 
             WHEN avg_rsrp < -100 AND density_diff < 0 THEN ' Cần để ý' 
@@ -76,7 +62,6 @@ def fetch_dashboard_data(date_str, selected_h3, selected_cell):
         FROM CalculatedDiff
         """
         
-        # 2. SQL Kéo dữ liệu Lịch sử
         query_trend_history = f"""
             SELECT 
                 date_parse(f.date || ' ' || LPAD(CAST(f.hour AS VARCHAR), 2, '0') || ':00:00', '%Y-%m-%d %H:%i:%s') AS record_time_dt,
@@ -88,7 +73,6 @@ def fetch_dashboard_data(date_str, selected_h3, selected_cell):
             GROUP BY 1 ORDER BY 1
         """
 
-        # 3. SQL Kéo dữ liệu Dự báo Đa biến (RSRP + Density + Dải rủi ro)
         query_trend_forecast = f"""
             SELECT 
                 CAST(f.forecast_time AS TIMESTAMP) AS record_time_dt,
@@ -103,7 +87,6 @@ def fetch_dashboard_data(date_str, selected_h3, selected_cell):
             GROUP BY 1 ORDER BY 1
         """
 
-        # 4. SQL Kéo Ma trận Heatmap
         query_heatmap = f"""
             SELECT hour, day_of_week(CAST(date AS DATE)) as dow_num, AVG(user_density_count) AS avg_density      
             FROM lakehouse.default.fact_mdt_hourly f
@@ -112,14 +95,29 @@ def fetch_dashboard_data(date_str, selected_h3, selected_cell):
             GROUP BY hour, day_of_week(CAST(date AS DATE))
         """
 
-        # 5. SQL Tính toán Toán học Shannon Alert
         query_risk = f"""
             SELECT COUNT(DISTINCT f.cell_id) as overload_risk_cells
             FROM lakehouse.default.fact_forecast_hourly f
-            LEFT JOIN lakehouse.default.dim_cell c ON f.cell_id = UPPER(TRIM(c.cell_code))
             WHERE CAST(f.forecast_date AS DATE) >= CAST('{date_str}' AS DATE)
-              AND f.forecast_upper > (COALESCE(c.bandwidth, 20) * 15)
+              AND f.forecast_upper > 300
               {h3_cond} {cell_cond}
+        """
+
+        query_metrics = f"""
+            SELECT 
+                cell_id as "Mã Trạm (Cell ID)",
+                ROUND(AVG(mae_density), 2) as "MAE (User)",
+                ROUND(AVG(mape_density), 2) as "MAPE (User) %",
+                ROUND(AVG(rmse_density), 2) as "RMSE (User)",
+                ROUND(AVG(mae_rsrp), 2) as "MAE (RSRP dBm)",
+                ROUND(AVG(mape_rsrp), 2) as "MAPE (RSRP) %",
+                ROUND(AVG(rmse_rsrp), 2) as "RMSE (RSRP dBm)"
+            FROM lakehouse.default.fact_forecast_hourly f
+            WHERE CAST(f.forecast_date AS DATE) >= CAST('{date_str}' AS DATE)
+            {h3_cond} {cell_cond}
+            GROUP BY cell_id
+            ORDER BY "MAPE (User) %" DESC
+            LIMIT 100
         """
 
         query_audit = f"SELECT * FROM lakehouse.default.quality_report WHERE date = '{date_str}' ORDER BY CAST(hour AS INTEGER) ASC"
@@ -130,67 +128,62 @@ def fetch_dashboard_data(date_str, selected_h3, selected_cell):
         df_hm = pd.read_sql_query(query_heatmap, conn)
         df_risk = pd.read_sql_query(query_risk, conn)
         
+        try: df_metrics = pd.read_sql_query(query_metrics, conn)
+        except: df_metrics = pd.DataFrame()
+
         try: df_audit = pd.read_sql_query(query_audit, conn)
         except: df_audit = pd.DataFrame() 
 
-        # Xử lý kiểu dữ liệu cơ bản cho Bản đồ
         if not df_spatial.empty:
             float_cols = ['cell_lat', 'cell_lon', 'h3_center_lat', 'h3_center_lon', 'avg_rsrp', 'p10_rsrp']
             for col in float_cols: 
                 if col in df_spatial.columns: df_spatial[col] = pd.to_numeric(df_spatial[col], errors='coerce')
             df_spatial['avg_distance_km'] = pd.to_numeric(df_spatial['avg_distance_km'], errors='coerce').fillna(0.0)
             df_spatial['user_density'] = pd.to_numeric(df_spatial['user_density'], errors='coerce').fillna(0).astype(int)
-            df_spatial['bandwidth'] = pd.to_numeric(df_spatial['bandwidth'], errors='coerce').fillna(20).astype(int)
             df_spatial['h3_index'] = df_spatial['h3_index'].astype(str)
             df_spatial['record_time'] = pd.to_datetime(df_spatial['record_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
 
-        return df_spatial, df_history, df_forecast, df_hm, df_risk, df_audit, None
+        return df_spatial, df_history, df_forecast, df_hm, df_risk, df_audit, df_metrics, None
 
     except Exception as e:
-        return None, None, None, None, None, None, f"Thất bại khi xử lý dữ liệu: {e}"
+        return None, None, None, None, None, None, None, f"Thất bại khi xử lý dữ liệu: {e}"
     finally:
         if conn:
             conn.close()
 
-# =========================================================================
-# GIAO DIỆN VÀ ĐIỀU KHIỂN (UI)
-# =========================================================================
 st.sidebar.title("🛠️ Bảng Điều Khiển")
 default_date = datetime.date.today() - datetime.timedelta(days=1) 
-selected_date = st.sidebar.date_input("📅 Chọn Ngày", default_date)
+selected_date = st.sidebar.date_input(" Chọn Ngày", default_date)
 date_str = selected_date.strftime("%Y-%m-%d")
 
-# 1. KÉO DANH SÁCH BỘ LỌC ĐỘC LẬP
 df_filters = fetch_filter_options(date_str)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔎 Phân tích Cục bộ (Cell-Level)")
+st.sidebar.subheader(" Phân tích Cục bộ (Cell-Level)")
 
 if not df_filters.empty:
     list_h3 = ["Toàn mạng lưới"] + sorted([str(x) for x in df_filters['h3_index'].dropna().unique()])
-    selected_h3 = st.sidebar.selectbox("📍 Chọn khu vực (H3 Index)", list_h3, key="h3_key")
+    selected_h3 = st.sidebar.selectbox(" Chọn khu vực (H3 Index)", list_h3, key="h3_key")
 
     if selected_h3 != "Toàn mạng lưới":
         df_filters = df_filters[df_filters['h3_index'] == selected_h3]
 
     list_cell = ["Toàn mạng lưới"] + sorted([str(x) for x in df_filters['cell_id'].dropna().unique()])
-    selected_cell = st.sidebar.selectbox("🗼 Chọn Trạm (Cell ID)", list_cell, key="cell_key")
+    selected_cell = st.sidebar.selectbox(" Chọn Trạm (Cell ID)", list_cell, key="cell_key")
 else:
     selected_h3, selected_cell = "Toàn mạng lưới", "Toàn mạng lưới"
     st.sidebar.warning("Không tìm thấy danh sách trạm. Vui lòng kiểm tra lại Data ca này.")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🎯 Bộ lọc Hiển thị")
-alert_mode = st.sidebar.toggle("🔴 Chỉ hiện khu vực RSRP < -100 dBm")
+st.sidebar.subheader(" Bộ lọc Hiển thị")
+alert_mode = st.sidebar.toggle(" Chỉ hiện khu vực RSRP < -120 dBm")
 
-# Cập nhật Tiêu đề Biểu đồ
 chart_title_suffix = "Toàn mạng"
 if selected_cell != "Toàn mạng lưới": chart_title_suffix = f"Trạm: {selected_cell}"
 elif selected_h3 != "Toàn mạng lưới": chart_title_suffix = f"H3: {selected_h3}"
 
-# 2. GỌI TRUY VẤN CHÍNH
 with st.spinner(f"Trino đang xử lý tính toán phân tán cho {chart_title_suffix}..."):
-    df_spatial, df_history, df_forecast, df_hm, df_risk, df_audit, err = fetch_dashboard_data(date_str, selected_h3, selected_cell)
+    df_spatial, df_history, df_forecast, df_hm, df_risk, df_audit, df_metrics, err = fetch_dashboard_data(date_str, selected_h3, selected_cell)
 
 if err:
     st.error(err)
@@ -200,41 +193,33 @@ if df_spatial is None or df_spatial.empty:
     st.stop()
 
 if alert_mode:
-    df_spatial = df_spatial[df_spatial['avg_rsrp'] < -100]
+    df_spatial = df_spatial[df_spatial['avg_rsrp'] < -120]
 
 csv = df_spatial.to_csv(index=False).encode('utf-8')
-st.sidebar.download_button(label="⬇️ Tải Data CSV hiện tại", data=csv, file_name=f'mdt_coverage_{date_str}.csv', mime='text/csv')
+st.sidebar.download_button(label="⬇ Tải Data CSV hiện tại", data=csv, file_name=f'mdt_coverage_{date_str}.csv', mime='text/csv')
 
-# =========================================================================
-# KPI PANEL MỞ BÀI
-# =========================================================================
-st.header(f"📍 Báo cáo Vùng Phủ MDT - {date_str} ({chart_title_suffix})")
+st.header(f" Báo cáo Vùng Phủ MDT - {date_str} ({chart_title_suffix})")
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 total_users = df_spatial['user_density'].sum()
-weak_count = df_spatial[df_spatial['avg_rsrp'] < -110].shape[0]
+weak_count = df_spatial[df_spatial['avg_rsrp'] < -120].shape[0]
 avg_rsrp_overall = df_spatial['avg_rsrp'].mean()
 
 with c1: st.metric("Tổng thiết bị (User Density)", f"{total_users:,}")
-with c2: st.metric("Trạm báo động (< -110 dBm)", f"{weak_count:,}", delta=f"{weak_count} trạm yếu", delta_color="inverse")
+with c2: st.metric("Trạm báo động (< -120 dBm)", f"{weak_count:,}", delta=f"{weak_count} trạm yếu", delta_color="inverse")
 with c3: st.metric("RSRP Trung bình hệ thống", f"{avg_rsrp_overall:.1f} dBm")
-with c4: st.metric("Băng thông trung bình", "20 MHz")
 
 if weak_count > 500:
-    st.error(f"⚠️ CẢNH BÁO MẠNG LƯỚI: Đang có {weak_count} điểm đo có tín hiệu RSRP rơi vào ngưỡng rất kém. Đề nghị tối ưu góc ngẩng (tilt).")
+    st.error(f" CẢNH BÁO MẠNG LƯỚI: Đang có {weak_count} điểm đo có tín hiệu RSRP rơi vào ngưỡng rất kém.")
 
 if not df_risk.empty:
     overload_risk_cells = df_risk['overload_risk_cells'].iloc[0]
     if overload_risk_cells > 0:
-        st.warning(f"🤖 **AI SON PROACTIVE ALERT**: Phát hiện **{overload_risk_cells}** trạm có xác suất cao chạm ngưỡng nghẽn vật lý trong thời gian tới (Upper Bound > Max Capacity). Đề nghị chủ động Load Balancing.")
+        st.warning(f" ** PROACTIVE ALERT**: Phát hiện **{overload_risk_cells}** trạm có xác suất cao chạm ngưỡng nghẽn vật lý trong thời gian tới (Upper Bound > Max Capacity). Đề nghị chủ động Load Balancing.")
 
-# =========================================================================
-# CHUẨN BỊ DỮ LIỆU JSON TỪ PANDAS
-# =========================================================================
 df_history['record_time_dt'] = pd.to_datetime(df_history['record_time_dt'])
 df_history['is_forecast'] = False
 df_history['upper_density'] = df_history['total_density'] 
-# Khởi tạo cận rủi ro lịch sử (trùng với thực tế để biểu đồ gọn gàng)
 df_history['lower_rsrp'] = df_history['mean_rsrp']
 df_history['upper_rsrp'] = df_history['mean_rsrp']
 
@@ -276,9 +261,6 @@ if not df_hm.empty:
 heatmap_list = [{"x": f"{h:02d}:00", "y": dow_map[d], "v": heatmap_dict[f"{h}_{d}"]} for d in range(1, 8) for h in range(24)]
 js_heatmap_data = json.dumps(heatmap_list)
 
-# =========================================================================
-# VẼ BẢN ĐỒ VÀ CHART.JS
-# =========================================================================
 esri_style = {
     "version": 8,
     "sources": {
@@ -385,33 +367,30 @@ dashboard_injection = f"""
 
     new Chart(document.getElementById('chartHeatmap'), {{ type: 'matrix', data: {{ datasets: [{{ label: 'Tải hệ thống', data: {js_heatmap_data}, backgroundColor: ctx => {{ if (!ctx.dataset.data[ctx.dataIndex]) return 'transparent'; const v = ctx.dataset.data[ctx.dataIndex].v; if (v === 0) return 'rgba(255, 255, 255, 0.05)'; const pct = v / {max_density}; if (pct >= 0.8) return '#081d58'; if (pct >= 0.6) return '#225ea8'; if (pct >= 0.4) return '#41b6c4'; if (pct >= 0.2) return '#c7e9b4'; return '#ffffcc'; }}, borderColor: 'rgba(255,255,255,0.05)', borderWidth: 1, width: c => (c.chartArea ? c.chartArea.width : 300) / 24 - 1, height: c => (c.chartArea ? c.chartArea.height : 100) / 7 - 1 }}] }}, options: {{ maintainAspectRatio: false, plugins: {{ title: {{ display: true, text: 'Ma trận tải tuần hoàn ({chart_title_suffix})', color: '#fff' }} }}, scales: {{ x: {{ type: 'category', labels: {json.dumps([f"{i:02d}:00" for i in range(24)])}, ticks: {{ color: '#a0aec0', maxTicksLimit: 8 }} }}, y: {{ type: 'category', labels: {json.dumps(["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"])}, ticks: {{ color: '#a0aec0' }} }} }} }} }});
     new Chart(document.getElementById('chartPoor'), {{ type: 'bar', data: {{ labels: labels, datasets: [{{ label: 'Khu vực kém', data: {js_poor_cells}, backgroundColor: isForecast.map(f => f ? 'rgba(245, 101, 101, 0.4)' : '#f56565') }}] }}, options: {{ ...commonOptions, plugins: {{ title: {{ display: true, text: 'Cảnh báo vùng chất lượng kém ({chart_title_suffix})', color: '#fff' }} }} }} }});
-    
-    new Chart(document.getElementById('chartDensity'), {{ 
-        type: 'line', 
-        data: {{ 
-            labels: labels, 
-            datasets: [
-                {{ label: 'Rủi ro bùng phát tối đa (Upper Bound)', data: {js_upper_density}, borderColor: 'rgba(245, 101, 101, 0.8)', backgroundColor: 'transparent', pointRadius: 0, borderDash: [3, 3], borderWidth: 2, tension: 0.3 }}, 
-                {{ label: 'User Density', data: {js_density}, borderColor: '#38b2ac', backgroundColor: 'rgba(56, 178, 172, 0.2)', fill: true, pointStyle: pointStyles, tension: 0.3, segment: {{ borderDash: segmentStyles }} }}
-            ] 
-        }}, 
-        options: {{ ...commonOptions, plugins: {{ title: {{ display: true, text: 'Xu hướng User Density & Rủi ro 3h ({chart_title_suffix})', color: '#fff' }} }} }} 
-    }});
-
-    new Chart(document.getElementById('chartRsrp'), {{ 
-        type: 'line', 
-        data: {{ 
-            labels: labels, 
-            datasets: [
-                {{ label: 'Biên độ nhiễu tối đa (Upper RSRP)', data: {js_rsrp_upper}, borderColor: 'rgba(236, 201, 75, 0.4)', backgroundColor: 'transparent', pointRadius: 0, borderDash: [3, 3], borderWidth: 1, tension: 0.3 }},
-                {{ label: 'Rủi ro suy hao sóng (Lower RSRP)', data: {js_rsrp_lower}, borderColor: 'rgba(236, 201, 75, 0.4)', backgroundColor: 'rgba(236, 201, 75, 0.1)', fill: '-1', pointRadius: 0, borderDash: [3, 3], borderWidth: 1, tension: 0.3 }},
-                {{ label: 'Avg RSRP', data: {js_rsrp}, borderColor: '#ecc94b', backgroundColor: 'transparent', pointStyle: pointStyles, tension: 0.3, segment: {{ borderDash: segmentStyles }} }}
-            ] 
-        }}, 
-        options: {{ ...commonOptions, plugins: {{ title: {{ display: true, text: 'Biến động & Dải rủi ro Avg RSRP ({chart_title_suffix})', color: '#fff' }} }} }} 
-    }});
+    new Chart(document.getElementById('chartDensity'), {{ type: 'line', data: {{ labels: labels, datasets: [{{ label: 'Rủi ro bùng phát tối đa (Upper Bound)', data: {js_upper_density}, borderColor: 'rgba(245, 101, 101, 0.8)', backgroundColor: 'transparent', pointRadius: 0, borderDash: [3, 3], borderWidth: 2, tension: 0.3 }}, {{ label: 'User Density', data: {js_density}, borderColor: '#38b2ac', backgroundColor: 'rgba(56, 178, 172, 0.2)', fill: true, pointStyle: pointStyles, tension: 0.3, segment: {{ borderDash: segmentStyles }} }}] }}, options: {{ ...commonOptions, plugins: {{ title: {{ display: true, text: 'Xu hướng User Density & Rủi ro ({chart_title_suffix})', color: '#fff' }} }} }} }});
+    new Chart(document.getElementById('chartRsrp'), {{ type: 'line', data: {{ labels: labels, datasets: [{{ label: 'Biên độ nhiễu tối đa (Upper RSRP)', data: {js_rsrp_upper}, borderColor: 'rgba(236, 201, 75, 0.4)', backgroundColor: 'transparent', pointRadius: 0, borderDash: [3, 3], borderWidth: 1, tension: 0.3 }}, {{ label: 'Rủi ro suy hao sóng (Lower RSRP)', data: {js_rsrp_lower}, borderColor: 'rgba(236, 201, 75, 0.4)', backgroundColor: 'rgba(236, 201, 75, 0.1)', fill: '-1', pointRadius: 0, borderDash: [3, 3], borderWidth: 1, tension: 0.3 }}, {{ label: 'Avg RSRP', data: {js_rsrp}, borderColor: '#ecc94b', backgroundColor: 'transparent', pointStyle: pointStyles, tension: 0.3, segment: {{ borderDash: segmentStyles }} }}] }}, options: {{ ...commonOptions, plugins: {{ title: {{ display: true, text: 'Biến động & Dải rủi ro RSRP ({chart_title_suffix})', color: '#fff' }} }} }} }});
 </script>
 """
 parts = html_content.rsplit("</body>", 1)
 components.html(f"{parts[0]}{dashboard_injection}</body>{parts[1]}", height=850, scrolling=True)
 if os.path.exists(temp_html_path): os.remove(temp_html_path)
+
+# =========================================================================
+# VẼ BẢNG ĐÁNH GIÁ MÔ HÌNH (THÊM MỚI Ở DƯỚI CÙNG)
+# =========================================================================
+st.markdown("---")
+st.subheader(" Báo cáo Đánh giá Sai số Mô hình AI (Model Evaluation Metrics)")
+if df_metrics is not None and not df_metrics.empty:
+    st.dataframe(
+        df_metrics.style.format({
+            "MAE (User)": "{:.2f}",
+            "MAPE (User) %": "{:.2f}%",
+            "RMSE (User)": "{:.2f}",
+            "MAE (RSRP dBm)": "{:.2f}",
+            "MAPE (RSRP) %": "{:.2f}%",
+            "RMSE (RSRP dBm)": "{:.2f}"
+        }).background_gradient(subset=["MAPE (User) %", "MAPE (RSRP) %"], cmap="YlOrRd"),
+        use_container_width=True
+    )
+else:
+    st.info("Chưa có dữ liệu đánh giá sai số mô hình (Metrics) cho khu vực/trạm này. Đang chờ dữ liệu đủ lớn để tính toán.")

@@ -125,7 +125,7 @@ def main():
         return output_pd[[f.name for f in forecast_schema.fields]]
 
     # 4. Kích hoạt phân tán Cluster
-    print("🤖 Đang chạy Huấn luyện Kép Prophet (Density + RSRP) trên toàn cụm...")
+    print(" Đang chạy Huấn luyện Kép Prophet (Density + RSRP) trên toàn cụm...")
     forecast_df = (
         df_prep.groupBy("h3_index", "cell_id")
         .applyInPandas(forecast_multivariate, schema=forecast_schema)

@@ -19,7 +19,7 @@ def main():
         cur.execute("CREATE SCHEMA IF NOT EXISTS lakehouse.default WITH (location = 's3://gold/')")
         cur.fetchall()
 
-        # Danh sách cấu trúc Star Schema mới
+        # Danh sách cấu trúc Star Schema
         tables = {
             "fact_mdt_hourly": "s3://gold/fact_mdt_hourly/",  
             "dim_cell": "s3://gold/dim_cell/",               
@@ -30,19 +30,22 @@ def main():
         }
 
         for table_name, path in tables.items():
-            print(f" Đang kiểm tra metadata cho bảng: {table_name}...")
+            print(f"🔄 Đang cập nhật metadata cho bảng: {table_name}...")
             
-            cur.execute(f"SHOW TABLES IN lakehouse.default LIKE '{table_name}'")
-            table_exists = cur.fetchone()
-
-            if not table_exists:
-                print(f"Bảng {table_name} chưa tồn tại. Đang register...")
-                cur.execute(f"CALL lakehouse.system.register_table('default', '{table_name}', '{path}')")
+            # TUYỆT CHIÊU XỬ LÝ SCHEMA MISMATCH:
+            # Drop table để xóa cache cũ (yên tâm KHÔNG mất data ở MinIO vì đây là External Table)
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS lakehouse.default.{table_name}")
                 cur.fetchall()
-            else:
-                print(f"Bảng {table_name} đã tồn tại. Sẽ tự động sync metadata.")
+            except Exception:
+                pass
 
-            # Dọn rác
+            # Đăng ký lại bảng, Trino sẽ tự động quét file Delta log và nhận diện các cột mới thêm
+            print(f"  -> Đang register lại {table_name} với schema mới nhất...")
+            cur.execute(f"CALL lakehouse.system.register_table('default', '{table_name}', '{path}')")
+            cur.fetchall()
+
+            # Tối ưu hóa hiệu năng truy vấn (Z-Ordering / Vacuum)
             try:
                 cur.execute(f"ALTER TABLE lakehouse.default.{table_name} EXECUTE OPTIMIZE")
                 cur.fetchall()
@@ -51,7 +54,7 @@ def main():
             except Exception:
                 pass
 
-        print("✅ Xuất bản cấu trúc & Dọn rác Lakehouse HOÀN TẤT!")
+        print("✅ Xuất bản cấu trúc & Đồng bộ Schema Lakehouse HOÀN TẤT!")
 
     except Exception as e:
         print(f"❌ Lỗi khi tương tác với Trino Metastore: {e}")
