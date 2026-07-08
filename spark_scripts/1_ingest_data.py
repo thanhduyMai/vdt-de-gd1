@@ -3,6 +3,31 @@ import sys
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
 
+def delete_s3_file(spark, file_path):
+    """
+    Hàm sử dụng Hadoop FileSystem API qua PySpark JVM để xóa file trên S3/MinIO
+    """
+    try:
+        # Lấy các class Java cần thiết từ JVM của Spark
+        URI = spark._jvm.java.net.URI
+        Path = spark._jvm.org.apache.hadoop.fs.Path
+        FileSystem = spark._jvm.org.apache.hadoop.fs.FileSystem
+        conf = spark._jsc.hadoopConfiguration()
+
+        # Khởi tạo đối tượng FileSystem
+        fs = FileSystem.get(URI(file_path), conf)
+        hadoop_path = Path(file_path)
+
+        # Kiểm tra và xóa file (False = không xóa đệ quy vì đây là file, không phải thư mục)
+        if fs.exists(hadoop_path):
+            fs.delete(hadoop_path, False)
+            print(f" 🗑️ Đã dọn dẹp (xóa) file gốc tại: {file_path}")
+        else:
+            print(f" ⚠️ Không tìm thấy file để xóa: {file_path}")
+    except Exception as e:
+        print(f" ❌ Lỗi khi xóa file {file_path}: {str(e)}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--type", required=True, choices=['mdt', 'cell'], help="Loại dữ liệu cần ingest")
@@ -31,11 +56,14 @@ def main():
         
         df = spark.read.csv(input_path, header=True, inferSchema=True)
         df.write.format("delta").mode("overwrite").save(output_path)
-        print(" Ingest Cell hoàn tất!")
+        print(" ✅ Ingest Cell hoàn tất!")
+        
+        # Gọi hàm xóa file sau khi ghi thành công
+        delete_s3_file(spark, input_path)
 
     elif args.type == 'mdt':
         if not args.date or not args.hour:
-            print(" Lỗi: Ingest MDT bắt buộc phải có --date và --hour")
+            print(" ❌ Lỗi: Ingest MDT bắt buộc phải có --date và --hour")
             sys.exit(1)
             
         input_path = args.input_path if args.input_path else f"s3a://landingzone/mdt_{args.date.replace('-','')}{args.hour}.csv"
@@ -44,7 +72,7 @@ def main():
         
         raw_df = spark.read.csv(input_path, header=True)
         if len(raw_df.columns) == 0:
-            print(" File trống, luồng dừng an toàn.")
+            print(" ⚠️ File trống, luồng dừng an toàn.")
             sys.exit(0)
 
         # Xử lý partition chuẩn theo CSV mới
@@ -71,7 +99,10 @@ def main():
             .option("mergeSchema", "true") \
             .partitionBy("batch_date", "batch_hour").save(output_path)
             
-        print(" Ingest MDT hoàn tất!")
+        print(" ✅ Ingest MDT hoàn tất!")
+        
+        # Gọi hàm xóa file sau khi ghi thành công
+        delete_s3_file(spark, input_path)
 
 if __name__ == "__main__":
     main()

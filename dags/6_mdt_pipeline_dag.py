@@ -105,7 +105,7 @@ def fetch_sftp_to_minio_landing(execution_date, **kwargs):
 default_args = {
     'owner': 'data_engineer_team',
     'depends_on_past': False,
-    'start_date': datetime(2025, 5, 4, 0, 0), 
+    'start_date': datetime(2025, 5, 12, 0, 0), 
     'end_date': datetime(2025, 5, 31, 23, 0),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
@@ -163,13 +163,13 @@ with DAG(
         application_args=common_args
     )
 
-    task_forecast = SparkSubmitOperator(
-        task_id='6_forecast',
-        application='/opt/spark_scripts/6_forecast.py',
-        conn_id='spark_default',
-        execution_timeout=timedelta(minutes=30), 
-        application_args=common_args
-    )
+    #task_forecast = SparkSubmitOperator(
+     #   task_id='6_forecast',
+     #   application='/opt/spark_scripts/6_forecast.py',
+     #   conn_id='spark_default',
+     #   execution_timeout=timedelta(minutes=30), 
+      #  application_args=common_args
+    #)
 
     task_publish_trino = BashOperator(
         task_id='5_publish_to_trino',
@@ -177,4 +177,4 @@ with DAG(
     )
 
     # 3. KẾT NỐI ĐƯỜNG ỐNG
-    task_fetch_sftp >> task_ingest >> task_quality >> task_fact_builder >> task_forecast >> task_publish_trino
+    task_fetch_sftp >> task_ingest >> task_quality >> task_fact_builder >>  task_publish_trino
