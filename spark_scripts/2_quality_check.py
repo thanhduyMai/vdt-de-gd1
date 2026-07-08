@@ -27,9 +27,12 @@ def main():
         .config("spark.hadoop.hive.metastore.uris", "thrift://hive-metastore:9083")
         .getOrCreate()
     )
+    spark.sparkContext.setLogLevel("WARN")
+
 
     vn_tz = pytz.timezone('Asia/Ho_Chi_Minh')
     input_path = "s3a://bronze/mdt_raw/"
+    dim_cell_path = "s3a://gold/dim_cell/"
     clean_path = "s3a://silver/mdt_clean/"
     dirty_path = "s3a://silver/dirty_data/" 
     report_path = "s3a://silver/quality_report/"
@@ -41,11 +44,10 @@ def main():
         full_df = spark.read.format("delta").load(input_path)
         
         print("\n" + "="*60)
-        print("🕵️ MÁY QUÉT DEBUG: SỰ THẬT TRONG KHO BRONZE ĐANG CÓ GÌ?")
+        print(" MÁY QUÉT DEBUG: SỰ THẬT TRONG KHO BRONZE ĐANG CÓ GÌ?")
         print(f" -> Bạn đang yêu cầu tìm kiếm: batch_date='{args.date}' | batch_hour='{args.hour}'")
         print(" -> Dưới đây là danh sách CÁC PHÂN VÙNG ĐANG TỒN TẠI THỰC TẾ:")
         
-        # In ra danh sách các cặp ngày/giờ đang có data thật
         full_df.select("batch_date", "batch_hour").distinct().show(truncate=False)
         
         total_bronze = full_df.count()
@@ -53,7 +55,6 @@ def main():
         print("="*60 + "\n")
         # =====================================================================
 
-        # Sau khi in xong, áp dụng màng lọc như cũ
         df = full_df.filter((F.col("batch_date") == args.date) & (F.col("batch_hour") == args.hour))
         
     except Exception as e:
@@ -69,7 +70,7 @@ def main():
     late_count = 0
     on_time_count = total_raw_records
 
-    # COMPOSITE KEY THEO TÊN CỘT MỚI TỪ FILE CSV
+    # COMPOSITE KEY (Không có time_ms, dùng 6 cột cơ bản để xác định Uniqueness)
     unique_columns = ["device_code", "lat", "lng", "cell_code", "p_cell_rsrp", "p_cell_rsrq"]
     
     window_spec = Window.partitionBy(unique_columns).orderBy(F.lit(1))
@@ -85,7 +86,7 @@ def main():
     gx_df.expect_column_values_to_not_be_null(column="cell_code", mostly=1.0)
     gx_df.expect_column_value_lengths_to_be_between(column="cell_code", min_value=1, mostly=1.0)
 
-    # CHIỀU 2: Validity 
+    # CHIỀU 2: Validity (Hợp lệ dải đo vật lý)
     gx_df.expect_column_values_to_be_between(column="p_cell_rsrp", min_value=-140, max_value=-44, mostly=0.98)
     gx_df.expect_column_values_to_be_between(column="p_cell_rsrq", min_value=-20, max_value=-3, mostly=0.98)
 
@@ -95,7 +96,6 @@ def main():
     gx_df.expect_column_values_to_not_be_in_set(column="lat", value_set=[0.0], mostly=0.95)
     
     # CHIỀU 4: Consistency
-
     expected_date_hour = f"{args.date}-{args.hour}"
     gx_df.expect_column_values_to_be_in_set(column="date_hour", value_set=[expected_date_hour], mostly=1.0)
     
@@ -115,23 +115,59 @@ def main():
     print(f" [Điểm DQ (GX Rule Score)] : {success_rate:.2f}%")
     print(f"--------------------------------------------------\n")
 
-    # BỘ LỌC ĐẨY SANG TẦNG SILVER
+    # =====================================================================
+    # NÂNG CẤP CHIỀU VALIDITY: KIỂM ĐỊNH TÍNH HỢP LÝ KHÔNG GIAN (3-SIGMA)
+    # =====================================================================
+    dim_cell = spark.read.format("delta").load(dim_cell_path) \
+                    .withColumn("cell_code_dim", F.upper(F.regexp_replace(F.col("cell_code"), r"\s+", ""))) \
+                    .select("cell_code_dim", "station_lat", "station_lng")
+
+    df_cleaned_key = df_with_rn.withColumn("cell_code_upper", F.upper(F.regexp_replace(F.col("cell_code"), r"\s+", "")))
+    joined_df = df_cleaned_key.join(
+        F.broadcast(dim_cell),
+        df_cleaned_key["cell_code_upper"] == dim_cell["cell_code_dim"],
+        how="left"
+    ).drop("cell_code_upper", "cell_code_dim")
+
+    R = 6371.0
+    df_math = joined_df.withColumn(
+        "distance_to_cell_km",
+        F.coalesce(
+            F.acos(
+                F.sin(F.radians(F.col("lat"))) * F.sin(F.radians(F.col("station_lat"))) + 
+                F.cos(F.radians(F.col("lat"))) * F.cos(F.radians(F.col("station_lat"))) * F.cos(F.radians(F.col("station_lng") - F.col("lng")))
+            ) * R,
+            F.lit(9999.0) # Không tìm thấy tọa độ trạm -> Khoảng cách vô cực
+        )
+    )
+
+    window_cell = Window.partitionBy("cell_code")
+    df_stats = df_math.withColumn("mean_dist", F.avg("distance_to_cell_km").over(window_cell)) \
+                      .withColumn("std_dist", F.stddev("distance_to_cell_km").over(window_cell))
+    
+    
+    # =====================================================================
+    # BỘ LỌC ĐẨY SANG TẦNG SILVER (GỘP LUẬT TĨNH VÀ LUẬT ĐỘNG 3-SIGMA)
+    # =====================================================================
     clean_cond = (
         F.col("lat").isNotNull() & F.col("lng").isNotNull() & (F.col("lat") != 0.0) &
         F.col("lat").between(8.5, 23.4) & F.col("lng").between(102.1, 109.5) &
         F.col("p_cell_rsrp").between(-140, -44) & F.col("p_cell_rsrq").between(-20, -3) &
-        (F.col("rn") == 1) 
+        (F.col("rn") == 1) &
+        # LUẬT VALIDITY / REASONABLENESS MỚI THÊM:
+        (F.col("distance_to_cell_km") <= 50.0) &
+        (F.col("distance_to_cell_km") <= (F.col("mean_dist") + 3 * F.coalesce(F.col("std_dist"), F.lit(0))))
     )
 
-    clean_df = df_with_rn.filter(clean_cond).drop("rn", "batch_date", "batch_hour")
-    dirty_df = df_with_rn.filter(~clean_cond).drop("rn", "batch_date", "batch_hour")
+    clean_df = df_stats.filter(clean_cond).drop("rn", "batch_date", "batch_hour", "mean_dist", "std_dist", "station_lat", "station_lng")
+    dirty_df = df_stats.filter(~clean_cond).drop("rn", "batch_date", "batch_hour", "mean_dist", "std_dist", "station_lat", "station_lng")
 
     clean_count = clean_df.count()
     dirty_count = dirty_df.count()
 
     replace_condition = f"date = '{args.date}' AND hour = '{args.hour}'"
-    clean_df.withColumn("processed_at", F.current_timestamp()).write.format("delta").mode("overwrite").option("replaceWhere", replace_condition).partitionBy("date", "hour").save(clean_path)
-    dirty_df.withColumn("processed_at", F.current_timestamp()).write.format("delta").mode("overwrite").option("replaceWhere", replace_condition).partitionBy("date", "hour").save(dirty_path)
+    clean_df.withColumn("processed_at", F.current_timestamp()).write.format("delta").mode("overwrite").option("mergeSchema", "true").option("replaceWhere", replace_condition).partitionBy("date", "hour").save(clean_path)
+    dirty_df.withColumn("processed_at", F.current_timestamp()).write.format("delta").mode("overwrite").option("mergeSchema", "true").option("replaceWhere", replace_condition).partitionBy("date", "hour").save(dirty_path)
 
     report_data = [
         (args.date, args.hour, total_raw_records, late_count, on_time_count, duplicate_count, clean_count, dirty_count, 

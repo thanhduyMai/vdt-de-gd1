@@ -1,7 +1,25 @@
 from pyspark.sql import SparkSession
-import pyspark.sql.functions as F
-from pyspark.sql.types import StringType, DoubleType
-import h3
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+def generate_h3_for_strip(lat):
+    """
+    Hàm này sẽ chạy trực tiếp trên các Worker dưới dạng phân tán.
+    Mỗi worker xử lý 1 dải vĩ độ và sinh ra h3_index kèm tọa độ cùng một lúc.
+    """
+    import h3  # Import bên trong để worker nào cũng có thể gọi độc lập
+    
+    strip_poly = {
+        "type": "Polygon",
+        "coordinates": [[[102.1, lat], [109.5, lat], [109.5, lat+1], [102.1, lat+1], [102.1, lat]]]
+    }
+    
+    # Sinh danh sách các ô H3 cho dải vĩ độ hiện tại
+    indices = h3.polyfill(strip_poly, 9, geo_json_conformant=True)
+    
+    # Trả về dữ liệu dạng generator giúp tiết kiệm RAM tối đa cho worker
+    for h3_index in indices:
+        lat_center, lon_center = h3.h3_to_geo(h3_index)
+        yield (h3_index, float(lat_center), float(lon_center))
 
 def main():
     # 0. Khởi tạo SparkSession
@@ -19,53 +37,35 @@ def main():
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
 
-    # 1. Hàm tạo dải vĩ độ
-    def generate_h3_for_strips():
-        all_h3 = []
-        for lat in range(8, 24):
-            print(f"DEBUG: Đang xử lý dải lat {lat}...", flush=True)
-            strip_poly = {
-                "type": "Polygon",
-                "coordinates": [[[102.1, lat], [109.5, lat], [109.5, lat+1], [102.1, lat+1], [102.1, lat]]]
-            }
-            indices = list(h3.polyfill(strip_poly, 9, geo_json_conformant=True))
-            all_h3.extend(indices)
-        return all_h3
-
-    print("🚀 Đang tính toán H3 theo dải vĩ độ...", flush=True)
-    h3_indices = generate_h3_for_strips()
+    print("🚀 Đang gửi cấu hình dải vĩ độ xuống các Worker...", flush=True)
     
-    if h3_indices is None or len(h3_indices) == 0:
-        print("LỖI: H3_indices bị rỗng!", flush=True)
-        return
+    # Tạo danh sách vĩ độ từ 8 đến 23 (Chỉ có 16 phần tử trên Driver!)
+    latitudes = list(range(8, 24))
+    
+    # Phân bổ thành 16 partitions, tương ứng mỗi partition xử lý một dải vĩ độ độc lập
+    rdd_lat = spark.sparkContext.parallelize(latitudes, numSlices=len(latitudes))
+    
+    # Sử dụng flatMap để các worker đồng loạt sinh dữ liệu H3 và tọa độ center
+    rdd_h3 = rdd_lat.flatMap(generate_h3_for_strip)
+    
+    # Định nghĩa Schema tường minh cho DataFrame kết quả
+    schema = StructType([
+        StructField("h3_index", StringType(), True),
+        StructField("h3_center_lat", DoubleType(), True),
+        StructField("h3_center_lon", DoubleType(), True)
+    ])
+    
+    # Chuyển đổi trực tiếp thành DataFrame
+    df_dim = rdd_h3.toDF(schema)
 
-    print(f"✅ Đã có {len(h3_indices)} ô lục giác. Đang đẩy vào Spark...", flush=True)
-
-    # 2. Tạo DataFrame
-    rdd = spark.sparkContext.parallelize(h3_indices, numSlices=200)
-    df = rdd.map(lambda h: (h,)).toDF(["h3_index"])
-
-    # 3. UDF lấy tọa độ
-    @F.udf(returnType=StringType())
-    def get_lat(h3_index):
-        lat, lon = h3.h3_to_geo(h3_index)
-        return str(lat)
-
-    @F.udf(returnType=StringType())
-    def get_lon(h3_index):
-        lat, lon = h3.h3_to_geo(h3_index)
-        return str(lon)
-
-    df_dim = df.withColumn("h3_center_lat", get_lat(F.col("h3_index")).cast(DoubleType())) \
-               .withColumn("h3_center_lon", get_lon(F.col("h3_index")).cast(DoubleType()))
-
-    # 4. Ghi vào Gold
+    # 3. Ghi dữ liệu vào Delta Lake ở vùng Gold
     output_path = "s3a://gold/dim_h3/"
+    print("💾 Đang ghi dữ liệu phân tán vào Delta Lake...", flush=True)
+    
+    # Gộp về 50 file và ghi trực tiếp (save() là hàm chặn nên hoàn toàn an tâm)
     df_dim.repartition(50).write.format("delta").mode("overwrite").save(output_path)
     
-    # Dòng này cực quan trọng: Ép Spark không được đóng cho đến khi ghi xong
-    count = df_dim.count() 
-    print(f"🎉 Đã ghi xong {count} dòng dữ liệu vào Delta!", flush=True)
+    print("🎉 Đã ghi xong dữ liệu vào Delta Lake một cách an toàn và tối ưu!", flush=True)
     spark.stop()
     
 if __name__ == "__main__":
