@@ -3,7 +3,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Cài đặt đúng 4 thư viện cần thiết
-RUN pip install streamlit pandas keplergl trino
+RUN pip install streamlit pandas keplergl pymysql
 
 # Mở cổng mặc định của Streamlit
 EXPOSE 8501
