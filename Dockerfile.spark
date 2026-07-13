@@ -15,13 +15,12 @@ ENV PATH=$PATH:$SPARK_HOME/bin:$SPARK_HOME/sbin
 RUN pip install --default-timeout=1000 --retries=10 --no-cache-dir \
     pyspark==3.5.1 \
     h3==3.7.6 \
-    delta-spark==3.2.0 \
     great_expectations==0.15.50 \
     geopandas \
     psycopg2-binary \
     pandas \
-    trino \
     prophet \
+    pymysql \
     pyarrow
 
 # ==============================================================================
@@ -37,7 +36,9 @@ RUN curl -o $SPARK_HOME/jars/hadoop-aws-3.3.4.jar \
 
 
 
-RUN curl -o $SPARK_HOME/jars/delta-spark_2.12-3.2.0.jar \
-    https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar \
-    && curl -o $SPARK_HOME/jars/delta-storage-3.2.0.jar \
-    https://repo1.maven.org/maven2/io/delta/delta-storage/3.2.0/delta-storage-3.2.0.jar    
+# Xóa 2 lệnh tải delta-spark và delta-storage
+# Thêm lệnh tải Iceberg:
+RUN curl -o $SPARK_HOME/jars/iceberg-spark-runtime-3.5_2.12-1.5.0.jar \
+    https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.5.0/iceberg-spark-runtime-3.5_2.12-1.5.0.jar \
+    && curl -o $SPARK_HOME/jars/iceberg-aws-bundle-1.5.0.jar \
+    https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.5.0/iceberg-aws-bundle-1.5.0.jar

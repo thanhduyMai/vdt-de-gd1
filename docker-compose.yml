@@ -106,8 +106,12 @@ services:
       dockerfile: Dockerfile.spark
     container_name: mdt_spark_worker_2
     environment:
-      - SPARK_SQL_EXTENSIONS=io.delta.sql.DeltaSparkSessionExtension
-      - SPARK_SQL_CATALOG_SPARK_CATALOG=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      - SPARK_SQL_EXTENSIONS=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      - SPARK_SQL_CATALOG_spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog
+      - SPARK_SQL_CATALOG_spark_catalog_type=hive
+      - SPARK_SQL_CATALOG_spark_catalog_uri=thrift://hive-metastore:9083
+      - SPARK_SQL_CATALOG_spark_catalog_io__impl=org.apache.iceberg.aws.s3.S3FileIO
+      - SPARK_SQL_CATALOG_spark_catalog_s3__endpoint=http://minio:9000
       - PYSPARK_PYTHON=/usr/local/bin/python
       - PYSPARK_DRIVER_PYTHON=/usr/local/bin/python
     command: spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 -c 2 -m 2G
@@ -141,15 +145,32 @@ services:
       - minio_data4:/data4
 
   # 9. TRINO (The SQL Query Engine)
-  trino:
-    image: trinodb/trino:latest
-    container_name: mdt_trino
+  # 9. STARROCKS FRONTEND
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:latest
+    container_name: mdt_starrocks_fe
     ports:
-      - "8088:8080"
-    volumes:
-      - ./trino_etc/catalog:/etc/trino/catalog
+      - "8030:8030"
+      - "9020:9020"
+      - "9030:9030" # Port kết nối MySQL (dùng cho Streamlit/DataGrip)
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+    command: /opt/starrocks/fe/bin/start_fe.sh
     depends_on:
       - minio
+      - hive-metastore
+
+  # 10. STARROCKS BACKEND
+  starrocks-be:
+    image: starrocks/be-ubuntu:latest
+    container_name: mdt_starrocks_be
+    ports:
+      - "8040:8040"
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+    command: /opt/starrocks/be/bin/start_be.sh
+    depends_on:
+      - starrocks-fe
   # ---------------------------------------------------
   # HIVE METASTORE (Dùng chung DB với Airflow để tiết kiệm RAM)
   # ---------------------------------------------------
@@ -177,9 +198,11 @@ services:
       # Mount chung thư mục spark_scripts để nó đọc được file 7_app_streamlit.py
       - ./spark_scripts:/opt/spark_scripts
     depends_on:
-      - trino
+      - starrocks-fe
 volumes:
   minio_data1:
   minio_data2:
   minio_data3:
   minio_data4:
+  starrocks_fe_meta:
+  starrocks_be_storage:
