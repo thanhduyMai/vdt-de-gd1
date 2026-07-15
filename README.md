@@ -109,5 +109,14 @@ docker-compose up -d
 ### 3. Truy cập hệ thống 
 
 Airflow UI: Theo dõi DAGs điều phối dữ liệu viễn thông tại http://localhost:<airflow_port>.
+
 Trino UI: Truy vấn SQL Engine tốc độ cao tại http://localhost:<trino_port>.
+
 G-SQM Dashboard: Giám sát chất lượng mạng trực quan và bản đồ H3 tại http://localhost:<streamlit_port>
+
+
+##  Tài liệu đính kèm
+
+Bấm vào ảnh dưới đây để xem chi tiết file báo cáo PDF:
+
+[![Xem báo cáo PDF](./docs/pdf_preview.png)](./docs/VDT_2026_GSQM_Bao_Cao.pdf)
