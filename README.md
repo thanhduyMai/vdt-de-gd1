@@ -105,7 +105,9 @@ docker-compose build
 
 # Khởi chạy toàn bộ hệ thống Pipeline và Dashboard dưới nền
 docker-compose up -d
-### 3. Truy cập các dịch vụ
+```
+### 3. Truy cập hệ thống 
+
 Airflow UI: Theo dõi DAGs điều phối dữ liệu viễn thông tại http://localhost:<airflow_port>.
 Trino UI: Truy vấn SQL Engine tốc độ cao tại http://localhost:<trino_port>.
 G-SQM Dashboard: Giám sát chất lượng mạng trực quan và bản đồ H3 tại http://localhost:<streamlit_port>
