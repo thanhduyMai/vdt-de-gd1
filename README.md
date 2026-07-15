@@ -119,4 +119,4 @@ G-SQM Dashboard: Giám sát chất lượng mạng trực quan và bản đồ H
 
 Bấm vào ảnh dưới đây để xem chi tiết file báo cáo PDF:
 
-[![Xem báo cáo PDF](./docs/pdf_preview.png)](./docs/VDT_2026_GSQM_Bao_Cao.pdf)
+[![Xem báo cáo PDF](./docs/pdf_preview.png)](./docs/VDT_2026_G_SQM_Mai Thành Duy.pdf)
